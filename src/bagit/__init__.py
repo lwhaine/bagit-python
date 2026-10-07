@@ -535,16 +535,16 @@ class Bag(object):
             if key.startswith("data" + os.sep)
         )
 
-    def save(self, processes=1, manifests: ManifestOption | None = None):
+    def save(self, processes=1, manifests: ManifestOption | bool = False):
         """
         save will persist any changes that have been made to the bag
         metadata (self.info).
 
         If you have modified the payload of the bag (added, modified,
         removed files in the data directory) and want to regenerate manifests
-        set the manifests parameter to ManifestOption.GENERATE. 
+        set the manifests parameter to ManifestOption.GENERATE or True. 
 
-        The default is None since you
+        The default is False since you
         wouldn't want a save to accidentally create a new manifest for
         a corrupted bag.
 
@@ -598,7 +598,7 @@ class Bag(object):
                 Path(self.path) / "data", processes, algorithms=self.algorithms, encoding=self.encoding, manifest_option = manifests
             )
 
-            if manifests == ManifestOption.GENERATE:
+            if manifests == ManifestOption.GENERATE or manifests is True:
                 # Update Payload-Oxum
                 LOGGER.info(_("Updating Payload-Oxum in %s"), self.tag_file_name)
                 self.info["Payload-Oxum"] = "%s.%s" % (total_bytes, total_files)
@@ -678,6 +678,9 @@ class Bag(object):
     def has_oxum(self):
         return "Payload-Oxum" in self.info
 
+    def fix_invalid_uris_and_paths(self):
+        fix_bag_urls_and_paths(self)
+
     def validate(self,  processes=1, fast=False, completeness_only=False, validate_contents: bool = True) -> bool:
         """ Checks the structure and optionally the contents are valid.
 
@@ -687,9 +690,6 @@ class Bag(object):
         instead of re-calculating fixities and comparing them against the
         manifest. By default validate() will re-calculate fixities (fast=False).
         """
-
-        # Fix issues with bags produced by SIPGen
-        fix_bag_urls_and_paths(self)
 
         # Validate the bag
         self._validate_structure()
@@ -1355,10 +1355,9 @@ def calculate_manifest_values(data_dir, processes, algorithms=DEFAULT_CHECKSUMS)
     manifest_line_generator = partial(generate_manifest_lines, algorithms=algorithms, data_dir=data_dir)
 
     if processes > 1:
-        pool = multiprocessing.Pool(processes=processes)
-        checksums = pool.map(manifest_line_generator, _walk(data_dir))
-        pool.close()
-        pool.join()
+        checksums = _multiprocessing_pool_map(
+            manifest_line_generator, _walk(data_dir), processes=processes
+        )
     else:
         checksums = [manifest_line_generator(i) for i in _walk(data_dir)]
 
@@ -1406,7 +1405,7 @@ def write_manifest_file(manifest_file_path, algorithm, values, num_files, total_
             total_bytes[algorithm] += byte_count
 
                 
-def make_manifests(data_dir, processes, algorithms=DEFAULT_CHECKSUMS, encoding="utf-8", manifest_option: ManifestOption = ManifestOption.GENERATE):
+def make_manifests(data_dir, processes, algorithms=DEFAULT_CHECKSUMS, encoding="utf-8", manifest_option: ManifestOption | bool = True):
     num_files = defaultdict(lambda: 0)
     total_bytes = defaultdict(lambda: 0)
 
@@ -1416,7 +1415,7 @@ def make_manifests(data_dir, processes, algorithms=DEFAULT_CHECKSUMS, encoding="
     for algorithm, values in manifest_data.items():
         manifest_filename = "manifest-%s.txt" % algorithm
         manifest_file_path = Path(data_dir).parent / manifest_filename
-        if manifest_option == ManifestOption.GENERATE:
+        if manifest_option == ManifestOption.GENERATE or manifest_option is True:
             write_manifest_file(manifest_file_path, algorithm, values, num_files, total_bytes, encoding=encoding)
         elif manifest_option == ManifestOption.ADD_NEW:
             add_new_entries_to_manifest_file(manifest_file_path, algorithm, values, num_files, total_bytes)
