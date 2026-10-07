@@ -287,6 +287,84 @@ def make_bag(
     return Bag(bag_dir)
 
 
+def fix_invalid_uri(invalid_uri: str) -> urlparse.ParseResult:
+    """ Fix invalid URIs in fetch.txt"""
+
+    # Shortcircuit for valid URIs - if it contains a scheme, no need to fix
+    parsed = urlparse(invalid_uri)
+    if parsed.scheme:
+        return parsed
+    else:
+        LOGGER.warning(f"Invalid URI found in fetch.txt: {invalid_uri}. Attempting to fix.")
+        with_forward_slashes = invalid_uri.replace("%5C", "/")
+
+        # Manually parse from the exact invalid format we're expecting
+        netloc = invalid_uri.split("%5C")[2]
+        path = with_forward_slashes.replace(f"//{netloc}", "")
+
+        # Also parse with urlparse to ensure we have a valid URI
+        with_netloc = f"file:{with_forward_slashes}"
+        parsed = urlparse(with_netloc)
+
+        # Compare manually parsed netloc and path with urlparse results
+        # This will hopefully raise if the URI is invalid in a different way from what we're expecting
+        if not netloc == parsed.netloc:
+            raise ValueError(
+                f"Error in Invalid fetch.txt URI correction: netloc mismatch: {netloc} != {parsed.netloc}"
+            )
+
+        if not path == parsed.path:
+            raise ValueError(
+                f"Error in Invalid fetch.txt URI correction: Path mismatch: {path} != {parsed.path}"
+            )
+
+        return parsed
+     
+def fix_bag_urls_and_paths(bag: Bag):
+    """ Fix issues with bag URIs and paths
+    
+    Add schema to invalid URIs in fetch.txt 
+    Replace backslashes with forward slashes in file paths in fetch.txt and manifest files 
+    """
+
+    def write_lines(file_path: Path | str, lines: list[str]):
+        with open(file_path, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line)
+
+    # Fix issues with fetch.txt
+    fetch_file_path = Path(bag.path) / "fetch.txt"
+    corrected_lines = []
+    if os.path.isfile(fetch_file_path):
+
+        with open(fetch_file_path, "r", encoding="utf-8") as fetch_file:
+            for line in fetch_file.readlines():
+                url, file_size, filename = line.strip().split(None, 2)
+                parsed_url = fix_invalid_uri(url)
+                if '\\' in filename:
+                    LOGGER.warning(f"Invalid filename found in fetch.txt: {filename}. Replacing backslashes with forward slashes.")
+                filename = filename.replace("\\", "/")
+                corrected_lines.append(
+                    f"{parsed_url.geturl()} {file_size} {filename}\n"
+                )
+
+        write_lines(fetch_file_path, corrected_lines)
+
+    # Fix issues with manifest file
+    for manifest_file in bag.manifest_files():
+        corrected_lines = []
+
+        with open(manifest_file, "r", encoding="utf-8") as mf:
+            for line in mf.readlines():
+                # Ensure file paths use forward slashes
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2:
+                    checksum, file_path = parts
+                    file_path = file_path.replace("\\", "/")
+                    corrected_lines.append(f"{checksum} {file_path}\n")
+
+        write_lines(manifest_file, corrected_lines)
+
 class Bag(object):
     """A representation of a bag."""
 
@@ -612,23 +690,28 @@ class Bag(object):
     def has_oxum(self):
         return "Payload-Oxum" in self.info
 
-    def validate(self, processes=1, fast=False, completeness_only=False):
-        """Checks the structure and contents are valid.
+    def validate(self,  processes=1, fast=False, completeness_only=False, validate_contents: bool = True) -> bool:
+        """ Checks the structure and optionally the contents are valid.
 
+        validate_contents - If True, validate the contents of the bag (False setting used for holey bagits)
         If you supply the parameter fast=True the Payload-Oxum (if present) will
         be used to check that the payload files are present and accounted for,
         instead of re-calculating fixities and comparing them against the
         manifest. By default validate() will re-calculate fixities (fast=False).
         """
 
+        # Fix issues with bags produced by SIPGen
+        fix_bag_urls_and_paths(self)
+
+        # Validate the bag
         self._validate_structure()
         self._validate_bagittxt()
-
         self.validate_fetch()
 
-        self._validate_contents(
-            processes=processes, fast=fast, completeness_only=completeness_only
-        )
+        if validate_contents:
+            self._validate_contents(
+                processes=processes, fast=fast, completeness_only=completeness_only
+            )
 
         return True
 
