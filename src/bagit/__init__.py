@@ -3,6 +3,7 @@
 
 import argparse
 import codecs
+from enum import StrEnum
 import gettext
 import hashlib
 import logging
@@ -18,6 +19,7 @@ import warnings
 from collections import defaultdict
 from datetime import date
 from functools import partial
+from pathlib import Path
 
 try:
     from importlib.metadata import version
@@ -462,16 +464,23 @@ class Bag(object):
             if key.startswith("data" + os.sep)
         )
 
-    def save(self, processes=1, manifests=False):
+    def save(self, processes=1, manifests: ManifestOption | None = None):
         """
         save will persist any changes that have been made to the bag
         metadata (self.info).
 
         If you have modified the payload of the bag (added, modified,
         removed files in the data directory) and want to regenerate manifests
-        set the manifests parameter to True. The default is False since you
+        set the manifests parameter to ManifestOption.GENERATE. 
+
+        The default is None since you
         wouldn't want a save to accidentally create a new manifest for
         a corrupted bag.
+
+        If you want to update the manifests for any new files added to the bag
+        (but not remove any existing manifests), 
+        set the manifests parameter to ManifestOption.ADD_NEW.
+        This will error if any existing manifest entries have changed.
 
         If you want to control the number of processes that are used when
         recalculating checksums use the processes parameter.
@@ -522,9 +531,15 @@ class Bag(object):
                 "data", processes, algorithms=self.algorithms, encoding=self.encoding
             )
 
-            # Update Payload-Oxum
-            LOGGER.info(_("Updating Payload-Oxum in %s"), self.tag_file_name)
-            self.info["Payload-Oxum"] = "%s.%s" % (total_bytes, total_files)
+            if manifests == ManifestOption.GENERATE:
+                # Update Payload-Oxum
+                LOGGER.info(_("Updating Payload-Oxum in %s"), self.tag_file_name)
+                self.info["Payload-Oxum"] = "%s.%s" % (total_bytes, total_files)
+            elif manifests == ManifestOption.ADD_NEW:
+                # Add bytes and file counts to existing Payload-Oxum
+                existing_oxum = self.info.get("Payload-Oxum", "0.0")
+                existing_bytes, existing_files = map(int, existing_oxum.split("."))
+                self.info["Payload-Oxum"] = "%s.%s" % (existing_bytes + total_bytes, existing_files + total_files)
 
         _make_tag_file(self.tag_file_name, self.info)
 
@@ -1255,18 +1270,24 @@ def _make_tag_file(bag_info_path, bag_info):
                 f.write("%s: %s\n" % (h, txt))
 
 
-def make_manifests(data_dir, processes, algorithms=DEFAULT_CHECKSUMS, encoding="utf-8"):
+class ManifestOption(StrEnum):
+    GENERATE = "generate"
+    ADD_NEW = "add_new"
+
+
+def calculate_manifest_values(data_dir, processes, algorithms=DEFAULT_CHECKSUMS):
     LOGGER.info(
         _("Using %(process_count)d processes to generate manifests: %(algorithms)s"),
         {"process_count": processes, "algorithms": ", ".join(algorithms)},
     )
 
-    manifest_line_generator = partial(generate_manifest_lines, algorithms=algorithms)
+    manifest_line_generator = partial(generate_manifest_lines, algorithms=algorithms, data_dir=data_dir)
 
     if processes > 1:
-        checksums = _multiprocessing_pool_map(
-            manifest_line_generator, _walk(data_dir), processes=processes
-        )
+        pool = multiprocessing.Pool(processes=processes)
+        checksums = pool.map(manifest_line_generator, _walk(data_dir))
+        pool.close()
+        pool.join()
     else:
         checksums = [manifest_line_generator(i) for i in _walk(data_dir)]
 
@@ -1276,19 +1297,58 @@ def make_manifests(data_dir, processes, algorithms=DEFAULT_CHECKSUMS, encoding="
         for entry in batch:
             manifest_data.setdefault(entry[0], []).append(entry[1:])
 
-    # These will be keyed on the algorithm name so we can perform sanity checks
-    # below to catch failures in the hashing process:
+    return manifest_data
+
+def add_new_entries_to_manifest_file(manifest_file_path, algorithm, values, num_files, total_bytes):
+    # Read existing manifest lines if the file exists
+    existing_lines = []
+    if manifest_file_path.exists():
+        with open(manifest_file_path, "r", encoding="utf-8") as mf:
+            existing_lines = mf.readlines()
+
+    # Create a set of existing file paths to avoid duplicates
+    existing_file_paths = {}
+    for line in existing_lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            checksum, file_path = parts
+            existing_file_paths[file_path] = checksum
+
+    # Append new lines for files that are not already in the manifest
+    with open(manifest_file_path, "a", encoding="utf-8") as mf:
+        for digest, filename, byte_count in values:
+            if filename in existing_file_paths:
+                if not existing_file_paths[filename] == digest:
+                    raise ValueError(
+                        f"Checksum for existing file has changed: {filename}"
+                    )
+            else:
+                mf.write("%s  %s\n" % (digest, _encode_filename(filename)))
+                num_files[algorithm] += 1
+                total_bytes[algorithm] += byte_count
+
+def write_manifest_file(manifest_file_path, algorithm, values, num_files, total_bytes, encoding="utf-8"):
+    with open_text_file(manifest_file_path, "w", encoding=encoding) as manifest:
+        for digest, filename, byte_count in values:
+            manifest.write("%s  %s\n" % (digest, _encode_filename(filename)))
+            num_files[algorithm] += 1
+            total_bytes[algorithm] += byte_count
+
+                
+def make_manifests(data_dir, processes, algorithms=DEFAULT_CHECKSUMS, encoding="utf-8", manifest_option: ManifestOption = ManifestOption.GENERATE):
     num_files = defaultdict(lambda: 0)
     total_bytes = defaultdict(lambda: 0)
 
+    manifest_data = calculate_manifest_values(data_dir, processes, algorithms=algorithms)
+
+
     for algorithm, values in manifest_data.items():
         manifest_filename = "manifest-%s.txt" % algorithm
-
-        with open_text_file(manifest_filename, "w", encoding=encoding) as manifest:
-            for digest, filename, byte_count in values:
-                manifest.write("%s  %s\n" % (digest, _encode_filename(filename)))
-                num_files[algorithm] += 1
-                total_bytes[algorithm] += byte_count
+        manifest_file_path = Path(data_dir).parent / manifest_filename
+        if manifest_option == ManifestOption.GENERATE:
+            write_manifest_file(manifest_file_path, algorithm, values, num_files, total_bytes, encoding=encoding)
+        elif manifest_option == ManifestOption.ADD_NEW:
+            add_new_entries_to_manifest_file(manifest_file_path, algorithm, values, num_files, total_bytes)
 
     # We'll use sets of the values for the error checks and eventually return the payload oxum values:
     byte_value_set = set(total_bytes.values())
