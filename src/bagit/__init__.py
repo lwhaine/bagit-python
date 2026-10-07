@@ -176,9 +176,6 @@ def make_bag(
         LOGGER.error(_("Bag directory %s does not exist"), bag_dir)
         raise RuntimeError(_("Bag directory %s does not exist") % bag_dir)
 
-    # FIXME: we should do the permissions checks before changing directories
-    old_dir = os.path.abspath(os.path.curdir)
-
     try:
         # TODO: These two checks are currently redundant since an unreadable directory will also
         #       often be unwritable, and this code will require review when we add the option to
@@ -213,20 +210,18 @@ def make_bag(
         else:
             LOGGER.info(_("Creating data directory"))
 
-            # FIXME: if we calculate full paths we won't need to deal with changing directories
-            os.chdir(bag_dir)
-            cwd = os.getcwd()
-            temp_data = tempfile.mkdtemp(dir=cwd)
+            temp_data = tempfile.mkdtemp(dir=bag_dir)
 
-            for f in os.listdir("."):
-                if os.path.abspath(f) == temp_data:
+            for f in os.listdir(bag_dir):
+                f_full = os.path.join(bag_dir, f)
+                if f_full == temp_data:
                     continue
                 new_f = os.path.join(temp_data, f)
                 LOGGER.info(
                     _("Moving %(source)s to %(destination)s"),
-                    {"source": f, "destination": new_f},
+                    {"source": f_full, "destination": new_f},
                 )
-                os.rename(f, new_f)
+                os.rename(f_full, new_f)
 
             LOGGER.info(
                 _("Moving %(source)s to %(destination)s"),
@@ -234,7 +229,7 @@ def make_bag(
             )
             while True:
                 try:
-                    os.rename(temp_data, "data")
+                    os.rename(temp_data, os.path.join(bag_dir, "data"))
                     break
                 except PermissionError as e:
                     if hasattr(e, "winerror") and e.winerror == 5:
@@ -249,15 +244,15 @@ def make_bag(
 
             # permissions for the payload directory should match those of the
             # original directory
-            os.chmod("data", os.stat(cwd).st_mode)
+            os.chmod(os.path.join(bag_dir, "data"), os.stat(bag_dir).st_mode)
 
             total_bytes, total_files = make_manifests(
-                "data", processes, algorithms=checksums, encoding=encoding
+                os.path.join(bag_dir, "data"), processes, algorithms=checksums, encoding=encoding
             )
 
             LOGGER.info(_("Creating bagit.txt"))
             txt = """BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n"""
-            with open_text_file("bagit.txt", "w") as bagit_file:
+            with open_text_file(os.path.join(bag_dir,"bagit.txt"), "w") as bagit_file:
                 bagit_file.write(txt)
 
             LOGGER.info(_("Creating bag-info.txt"))
@@ -274,15 +269,13 @@ def make_bag(
                 )
 
             bag_info["Payload-Oxum"] = "%s.%s" % (total_bytes, total_files)
-            _make_tag_file("bag-info.txt", bag_info)
+            _make_tag_file(os.path.join(bag_dir, "bag-info.txt"), bag_info)
 
             for c in checksums:
                 _make_tagmanifest_file(c, bag_dir, encoding="utf-8")
     except Exception:
         LOGGER.exception(_("An error occurred creating a bag in %s"), bag_dir)
         raise
-    finally:
-        os.chdir(old_dir)
 
     return Bag(bag_dir)
 
@@ -599,14 +592,10 @@ class Bag(object):
                 _("Read permissions are required to calculate file fixities")
             )
 
-        # Change working directory to bag directory so helper functions work
-        old_dir = os.path.abspath(os.path.curdir)
-        os.chdir(self.path)
-
         # Generate new manifest files
         if manifests:
             total_bytes, total_files = make_manifests(
-                "data", processes, algorithms=self.algorithms, encoding=self.encoding
+                Path(self.path) / "data", processes, algorithms=self.algorithms, encoding=self.encoding, manifest_option = manifests
             )
 
             if manifests == ManifestOption.GENERATE:
@@ -619,7 +608,8 @@ class Bag(object):
                 existing_bytes, existing_files = map(int, existing_oxum.split("."))
                 self.info["Payload-Oxum"] = "%s.%s" % (existing_bytes + total_bytes, existing_files + total_files)
 
-        _make_tag_file(self.tag_file_name, self.info)
+        tag_file_path = Path(self.path) / self.tag_file_name
+        _make_tag_file(tag_file_path, self.info)
 
         # Update tag-manifest for changes to manifest & bag-info files
         for alg in self.algorithms:
@@ -627,8 +617,6 @@ class Bag(object):
 
         # Reload the manifests
         self._load_manifests()
-
-        os.chdir(old_dir)
 
     def tagfile_entries(self):
         return dict(
@@ -1477,9 +1465,10 @@ def _make_tagmanifest_file(alg, bag_dir, encoding="utf-8"):
 def _find_tag_files(bag_dir):
     for dir in os.listdir(bag_dir):
         if dir != "data":
-            if os.path.isfile(dir) and not dir.startswith("tagmanifest-"):
+            full_dir = os.path.join(bag_dir, dir)
+            if os.path.isfile(full_dir) and not dir.startswith("tagmanifest-"):
                 yield dir
-            for dir_name, _, filenames in os.walk(dir):
+            for dir_name, _, filenames in os.walk(full_dir):
                 for filename in filenames:
                     if filename.startswith("tagmanifest-"):
                         continue
@@ -1546,7 +1535,7 @@ def _can_read(test_dir):
     return (tuple(unreadable_dirs), tuple(unreadable_files))
 
 
-def generate_manifest_lines(filename, algorithms=DEFAULT_CHECKSUMS):
+def generate_manifest_lines(filename, data_dir, algorithms=DEFAULT_CHECKSUMS):
     LOGGER.info(_("Generating manifest lines for file %s"), filename)
 
     # For performance we'll read the file only once and pass it block
@@ -1567,10 +1556,11 @@ def generate_manifest_lines(filename, algorithms=DEFAULT_CHECKSUMS):
                 hasher.update(block)
 
     decoded_filename = _decode_filename(filename)
+    relative_filename = Path(decoded_filename).relative_to(Path(data_dir).parent).as_posix()
 
     # We'll generate a list of results in roughly manifest format but prefixed with the algorithm:
     results = [
-        (alg, hasher.hexdigest(), decoded_filename, total_bytes)
+        (alg, hasher.hexdigest(), relative_filename, total_bytes)
         for alg, hasher in hashers.items()
     ]
 
